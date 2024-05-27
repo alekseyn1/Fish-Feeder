@@ -20,15 +20,15 @@ tm tm;                              // the structure tm holds time information i
 #define MY_TZ "PST8PDT,M3.2.0,M11.1.0"   //https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
 
 /* Define the WiFi credentials */
-#define WIFI_SSID "Skywalker"
-#define WIFI_PASSWORD "Luke2024$$$!"
-#define WIFI_SSID2 "hassio"
-#define WIFI_PASSWORD2 "126651203"
+#define WIFI_SSID "wifi-ssid"
+#define WIFI_PASSWORD "wifi-password"
+#define WIFI_SSID2 "alternative wifi ssid"
+#define WIFI_PASSWORD2 "alternative wifi pw"
 
 // MQTT Broker
 const char *mqtt_broker = "192.168.10.2";
-const char *mqtt_username = "admin";
-const char *mqtt_password = "Luke2024$$$!";
+const char *mqtt_username = "user";
+const char *mqtt_password = "password";
 const char *topic_state = "FishFeeder/state";
 const char *topic_cmd = "FishFeeder/set";
 const char *topic_avl = "FishFeeder/availability";
