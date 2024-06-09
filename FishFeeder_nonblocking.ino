@@ -1,367 +1,568 @@
+//TopTilt V2-3, BLE Inclinometer beacon
+//idle power consumption at last run (7s avg = 40uA)
+
+//Import libraries
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
-#include <NTPClient.h>
-#include <Servo.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include <time.h>
+#include <bluefruit.h>
+#include <SX126x-RAK4630.h>
+#include <ZzzMovingAvg.h>
+#include <SPI.h>
+#include <SCL3300.h>
+#include "nrfx.h"
+#include "hal/nrf_nvmc.h"
+//#include "peripherals/nrf/power.h"
 
-ESP8266WiFiMulti wifiMulti;
-WiFiClient espClient;
-PubSubClient client(espClient);
-Servo servo;
+SCL3300 inclinometer;
 
-time_t now;                         // this are the seconds since Epoch (1970) - UTC
-tm tm;                              // the structure tm holds time information in a more convenient way
+// Forward declarations for callback functions
+void ble_connect_callback(uint16_t conn_handle);
+void ble_disconnect_callback(uint16_t conn_handle, uint8_t reason);
 
-/* Configuration of NTP */
-#define MY_NTP_SERVER "ca.pool.ntp.org"           
-#define MY_TZ "PST8PDT,M3.2.0,M11.1.0"   //https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
+//BLE Services setup
+BLEUart g_BleUart;
+BLEDfu bledfu;
+BLEBas blebas;    // BAS (Battery Service) helper class instance
+bool g_BleUartConnected = false;
 
-/* Define the WiFi credentials */
-#define WIFI_SSID "wifi-ssid"
-#define WIFI_PASSWORD "wifi-password"
-#define WIFI_SSID2 "alternative wifi ssid"
-#define WIFI_PASSWORD2 "alternative wifi pw"
+//battery reading parameters
+#define VBAT_MV_PER_LSB (0.73242188F) // 3.0V ADC range and 12 - bit ADC resolution = 3000mV / 4096
+#define VBAT_DIVIDER_COMP (1.0)      // Compensation factor for the VBAT divider, depend on the board
+#define REAL_VBAT_MV_PER_LSB (VBAT_DIVIDER_COMP * VBAT_MV_PER_LSB)
+#define battPin PIN_QSPI_IO3
 
-// MQTT Broker
-const char *mqtt_broker = "192.168.10.2";
-const char *mqtt_username = "user";
-const char *mqtt_password = "password";
-const char *topic_state = "FishFeeder/state";
-const char *topic_cmd = "FishFeeder/set";
-const char *topic_avl = "FishFeeder/availability";
-const char *topic_state_light = "FishFeeder/light/state";
-const char *topic_cmd_light = "FishFeeder/light/set";
-const char *topic_avl_light = "FishFeeder/light/availability";
-const int mqtt_port = 1883;
+//Globals
+char currentMode = 'p';
+char lastMode = '0';
 
-//Scheduled times for feeding 24hr format. No leading zeros, i.e. 8:00 and 20:00 are both 8 am and 8 pm feeding times
-//sample: const String times[]={"8:0:5","13:0:0","21:0:0"};
-const String times[]={"8:0:0","20:0:0"};
-const int arrayLength = sizeof(times) / sizeof(times[0]);
+unsigned int pauseInterval = 60; //change back to 60, time taken between BLE sends
 
-const String lights_on = "7"; //in the morning
-const String lights_off = "23"; //in the evening
+float accelX = -1.0;
+float accelY = -1.0;
+float accelXlast = 0.0;
+float accelYlast = 0.0;
+float accelXzero = 0.0;
+float accelYzero = 0.0;
+float reportX = -1.0;
+float reportY = -1.0;
 
-// Relay pin is controlled with D1. The active wire is connected to Normally Open and common
-int relay = D1;
+#define bLED 13
+#define wLED 14
+#define rLED 15
+#define gLED 16
 
-// End settings
+byte battLvl = -1;
+int rawBattLvl = -1;
 
-bool servoState = false;
-bool lightState = false;
-const bool auto_discovery = true;
-String client_id = "esp8266-";
-String currentTime = "";
-String currentHour = "";
+float accelThreshold = 5.0;
 
-long lastReconnectAttempt = 0;
+int dwellTime = -1;
 
-void setup() {
-  Serial.begin(115200);
-  delay(1500);
-  
-  // Pin for relay module set as output
-  pinMode(relay, OUTPUT); //OUTPUT_OPEN_DRAIN
-  
-  configTime(MY_TZ, MY_NTP_SERVER);
-  TimeNow();
-  Serial.println("Now is " + currentTime);
+bool catastrophe = false;
+bool significantChange = false;
 
-  client_id += ESP.getChipId();
-  Serial.println(client_id);
+byte advData[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00};
 
-  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
-  wifiMulti.addAP(WIFI_SSID2, WIFI_PASSWORD2);
+//Unique ID info for Device Name
+typedef volatile uint32_t REG32;
+#define pREG32 (REG32 *)
 
-  // WiFi.scanNetworks will return the number of networks found
-  int n = WiFi.scanNetworks();
-  delay(1500);
-  Serial.println();
-  Serial.println();
-  Serial.println();
-  Serial.println("Scan done");
-  if (n == 0) {
-      Serial.println("No networks found");
-  } 
+#define DEVICE_ID_HIGH    (*(pREG32 (0x10000060)))
+#define DEVICE_ID_LOW     (*(pREG32 (0x10000064)))
+
+//sample averaging setup
+#define numSamples 10
+ZzzMovingAvg <20, float, float> accelXfiltered;
+ZzzMovingAvg <20, float, float> accelYfiltered;
+
+int magReading = 2300;
+
+void setup()
+{
+  //Functions needed to obtain proper deep sleep levels
+  //nrf_peripherals_power_init();
+  lora_rak4630_init();
+  Radio.Sleep();
+
+  //configure Pins
+  pinMode(bLED, OUTPUT); digitalWrite(bLED, LOW);
+  pinMode(wLED, OUTPUT); digitalWrite(wLED, HIGH);
+  pinMode(rLED, OUTPUT); digitalWrite(rLED, LOW);
+  pinMode(gLED, OUTPUT); digitalWrite(gLED, LOW);
+  pinMode(WB_A1, INPUT);
+  pinMode(battPin, INPUT);
+
+
+  //Serial.begin(115200);
+
+  //Setup battery voltage sensing
+  analogReference(AR_INTERNAL_3_0);
+  analogReadResolution(12); // Can be 8, 10, 12 or 14
+
+
+
+  //Configure BLE
+  Bluefruit.configPrphConn(92, BLE_GAP_EVENT_LENGTH_MIN, 16, 16);
+
+  Bluefruit.begin(1, 0);
+  Bluefruit.autoConnLed(false);
+  //Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+
+  // Set max power. Accepted values are: -40, -30, -20, -16, -12, -8, -4, 0, 4
+  Bluefruit.setTxPower(4);
+  // Set the BLE device name
+  String IDstring = String(DEVICE_ID_LOW, HEX);
+  String nameString = "KTT#" + String(IDstring[0]) + String(IDstring[1]) + String(IDstring[2]) + String(IDstring[3]);
+  nameString.toUpperCase();
+  Bluefruit.setName(nameString.c_str()); //device name shows like KTT#cb4e, last four characters should be unique
+
+  //Setupcallbacks
+  Bluefruit.Periph.setConnectCallback(ble_connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(ble_disconnect_callback);
+
+  // Configure and Start BLE Uart Service and DFU service
+  bledfu.begin();
+  g_BleUart.begin();
+  blebas.begin();
+  blebas.write(getBattLevel());
+
+  setupAccel();
+
+  //Preemptively fill the averaging buffer
+  delay(200);
+  //setupAccel();
+  getManySamples(10);
+  getManySamples(10);
+
+
+  // Set up and start advertisements
+  // Advertising packet
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  //Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addManufacturerData(advData, 8);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(9999, 9999); // in unit of 0.625 ms
+  Bluefruit.Advertising.setFastTimeout(30);   // number of seconds in fast mode
+
+  updateAdv();
+
+  Bluefruit.Advertising.start(0);             // 0 = Don't stop advertising after n seconds
+
+  //Signal end of setup
+  digitalWrite(wLED, LOW);
+}
+
+
+
+void loop()
+{
+
+  BLEloop();
+  getManySamples(numSamples);
+  sendBLE();
+  updateAdv();
+
+
+}
+
+void BLEloop() {
+  if (!g_BleUartConnected) { //Check if we are connected or not
+    for (int i = 0; i < pauseInterval; i++) { //not connected, enter sleep loop that periodically checks for a zeroing magnet
+      delay(1000);
+      checkMag();
+    }
+    getBattLevel();
+  }
   else {
-    Serial.print(n);
-    Serial.println(" networks found");
-    for (int i = 0; i < n; ++i) {
-      Serial.print(i + 1);
-      Serial.print(": ");
-      Serial.print(WiFi.SSID(i));
-      Serial.print(" (");
-      Serial.print(WiFi.RSSI(i));
-      Serial.print(")");
-      Serial.println();
-      delay(10);
+    if (g_BleUart.available() > 0) {
+      parseBLEUART();
+    }
+    else {
+      delay(500);
+      checkMag();
     }
   }
-
-  Serial.println("Connecting Wifi...");
-  if(wifiMulti.run() == WL_CONNECTED) {
-    Serial.println("");
-    Serial.println("Wi-Fi CONNECTED!");
-    Serial.println("IP address: ");
-    Serial.print(WiFi.localIP());
-    Serial.println("");
-  }
-
-  Serial.println("Scheduled feeds start at (24hr format) ");
-  for (byte i = 0; i < arrayLength; i++) {
-    Serial.println(times[i]);
-  }
-
-  //connecting to a mqtt broker
-  client.setServer(mqtt_broker, mqtt_port);
-  client.setBufferSize(512);
-  client.setCallback(callback);
-  reconnect();
-  setupHaDiscovery();
-  lastReconnectAttempt = 0;
-
+  digitalWrite(bLED, HIGH);
+  delay(25);
+  digitalWrite(bLED, LOW);
 }
 
-void TimeNow() {
-  time(&now);                       // read the current time
-  localtime_r(&now, &tm);           // update the structure tm with the current time
-  currentHour = String(tm.tm_hour);
-  currentTime = String(tm.tm_hour)+":"+String(tm.tm_min)+":"+String(tm.tm_sec);
-}
-
-void setupHaDiscovery () {
-  char topic[128];
-  char topic1[128];
-
-  strcpy(topic, "homeassistant/switch/");
-  strcat(topic, client_id.c_str());
-  strcat(topic, "/config");
-
-  strcpy(topic1, "homeassistant/switch/");
-  strcat(topic1, client_id.c_str());
-  strcat(topic1, "-1/config");
-
-  if (auto_discovery) {
-    char buffer[1024]; //2048
-    DynamicJsonDocument doc(1024);
-    doc.clear();
-    doc["name"] = "Fish Feeder";
-    doc["unique_id"] = client_id;
-    doc["state_topic"] = topic_state;
-    doc["command_topic"] = topic_cmd;
-    doc["availability_topic"] = topic_avl;
-    doc["payload_on"] = "on";
-    doc["payload_off"] = "off";
-    doc["state_on"] = "on";
-    doc["state_off"] = "off";
-    doc["icon"] = "mdi:fish";
-    JsonObject device = doc.createNestedObject("device");
-    device["identifiers"] = client_id.c_str();
-    //device["name"] = "Fish Feeder";
-    device["model"] = "ESP8622";
-    device["manufacturer"] = "relit.ca";
-    serializeJson(doc, buffer);
-    serializeJson(doc, Serial);
-    client.publish(topic, buffer, true);
-    delay(1000);
-    client.publish(topic_cmd, "off");
-    client.publish(topic_state, "off");
-    client.publish(topic_avl, "online");
-    delay(1000);
-
-    
-    char buffer1[1024]="";
-    doc.clear();
-    doc["name"] = "Fish Feeder Light";
-    doc["unique_id"] = client_id+"_light";
-    doc["state_topic"] = topic_state_light;
-    doc["command_topic"] = topic_cmd_light;
-    doc["availability_topic"] = topic_avl_light;
-    doc["payload_on"] = "on";
-    doc["payload_off"] = "off";
-    doc["state_on"] = "on";
-    doc["state_off"] = "off";
-    doc["icon"] = "mdi:wall-sconce-flat";
-    JsonObject device1 = doc.createNestedObject("device");
-    device1["identifiers"] = client_id.c_str();
-    //device1["name"] = "Fish Feeder";
-    device1["model"] = "ESP8622";
-    device1["manufacturer"] = "relit.ca";
-    serializeJson(doc, buffer1);
-    serializeJson(doc, Serial);
-    client.publish(topic1, buffer1, true);
-    delay(1000);
-    client.publish(topic_cmd_light, "off");
-    client.publish(topic_state_light, "off");
-    client.publish(topic_avl_light, "online");    
-  } else {
-    //remove all entities by publishing empty payloads
-    client.publish(topic, "");
-    client.publish(topic1, "");
-  }
-}
-
-boolean reconnect() {
-      Serial.println("");
-      Serial.println("Now is " + currentTime);
-      Serial.printf("The client %s connects to the mqtt broker\n", client_id.c_str());
-      if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
-        Serial.println("Broker connected");
-        // publish and subscribe
-        client.publish(topic_avl, "online"); //servo
-        client.subscribe(topic_cmd);
-        client.publish(topic_avl_light, "online"); //led
-        client.subscribe(topic_cmd_light);
-      } else {
-          Serial.print("failed with state ");
-          Serial.print(client.state());
-          delay(2000);
-      }
-  return client.connected();
-}
-
-
-void callback(char *topic_, byte *payload, unsigned int length) {
-    Serial.print("Message arrived in topic: ");
-    Serial.println(topic_);
-    Serial.print("Message: ");
-    
-    String message;
-
-    for (int i = 0; i < length; i++) {
-        message += (char) payload[i];  // Convert *byte to string
-    }
-    Serial.print(message);
-
-    if (strcmp(topic_,topic_cmd)==0){
-      if (message == "on" && !servoState) {
-          feeding(); 
-          servoState = true;
-      }
-      if (message == "off" && servoState) {
-          servoState = false;
-      }
-    }
-
-    if (strcmp(topic_,topic_cmd_light)==0){
-      if (message == "on" && !lightState) {
-        digitalWrite(relay, HIGH); //lights on
-        client.publish(topic_state_light, "on");
-        client.publish(topic_cmd_light, "on");
-        lightState = true;
-      }
-      if (message == "off"  && lightState) {
-        digitalWrite(relay, LOW); //lights off
-        client.publish(topic_state_light, "off");
-        client.publish(topic_cmd_light, "off");
-        lightState = false;
-      }
-    }
-    Serial.println();
-    Serial.println("-------- end of callback ---------------");
-}
-
-//Writes a value in microseconds (uS) to the servo, controlling the shaft accordingly. 
-//On a standard servo, this will set the angle of the shaft. 
-//On standard servos a parameter value of 1000 is fully counter-clockwise, 2000 is fully clockwise, and 1500 is in the middle.
-
-void feeding() {
-      client.publish(topic_state, "on");
-      //String currentTime = String(tm.tm_hour)+":"+String(tm.tm_min)+":"+String(tm.tm_sec);
-      Serial.println();
-      Serial.println("Scheduled feeds start at (24hr format) ");
-      for (byte i = 0; i < arrayLength; i++) {
-        Serial.println(times[i]);
-      }
-      Serial.println();
-      servo.attach(D3); // Pin attached to D3
-      delay(1000);
-      //servo.writeMicroseconds(1000); // rotate clockwise
-      servo.write(0); 
-      delay(1000); //wait for one second so all food can come out from the feeder
-      //servo.writeMicroseconds(1500); // go to middle position
-      servo.write(90);  // set servo to mid-point
-      delay(1000);
-      servo.detach(); //this is done to prevent servo noise. this disconnects the servo.
-      Serial.println("Success. Fed at " + currentTime);
-      Serial.println();
-      Serial.println("Servo Disabled. Waiting for the next scheduled feed ");
-      delay(2000); //wait for one minute, milliseconds
-      client.publish(topic_state, "off");
-      client.publish(topic_cmd, "off");
-}
-
-// timer_state function determines whether the current time in minutes past midnight 
-// is within the timed interval start and start+duration, also in minutes past midnight
-// range may span midnight.  duration must be less than one day (1440).
-byte timer_state(unsigned int start, unsigned int duration, unsigned int now) {
-  unsigned int time_on = (now - start + 2880) % 1440;  //multiply minutes per day by two for safety
-  if (time_on < duration) return 1;  //within interval
-  return 0;  //not within interval
-}
-
-void loop() {
-
-  TimeNow();
+void checkMag() { //Function that checks if a magnet is nearby, and is removed in a timely manner. If not, it's assumed to be interference
+    int magNorm = 2300;
+    int magDeadzone = 250;
   
-  //Serial.println("Current Time");
-  //Serial.println(currentTime);
-
-  //Serial.println("Current Hour");
-  //Serial.println(currentHour);
-
-  //Serial.println("Now:");
-  //Serial.println(now);
-
-  //Serial.println("Time On");
-  //Serial.println((now - (22*60+58) + 2880) % 1440);
-
-  //Serial.println(timer_state((22*60+58), 60, now));
-
-  //Serial.println(lights_on.toInt() < currentHour.toInt());
-  //Serial.println(currentHour.toInt() < lights_off.toInt());
+    magReading = analogRead(WB_A1); //get reading
   
-  //Serial.println(lights_on.toInt());
-  //Serial.println(currentHour.toInt());
-  //Serial.println(lights_off.toInt());
-
-  if ( lights_on.toInt() < currentHour.toInt() && currentHour.toInt() < lights_off.toInt() ) {
-    //digitalWrite(relay, HIGH); //lights on
-    Serial.println("Relay ON");
-    //client.publish(topic_state_light, "on");
-    //client.publish(topic_cmd_light, "on");
-  } else {
-    //digitalWrite(relay, LOW); //lights off
-    Serial.println("Relay OFF");
-    //client.publish(topic_state_light, "off");
-    //client.publish(topic_cmd_light, "off");
-  }
-
-  for (byte i = 0; i < arrayLength; i++) {
-    if (times[i]==currentTime) {
-      feeding();
-    }
-  }
-
-  if (!client.connected()) {
-    long now = millis();
-    if (now - lastReconnectAttempt > 360000) { //attempt to reconnect once in hour
-      lastReconnectAttempt = now;
-      // Attempt to reconnect
-      if (reconnect()) {
-        lastReconnectAttempt = 0;
-        client.publish(topic_avl, "online");
+    if (magReading > magNorm + magDeadzone || magReading < magNorm - magDeadzone) { //check reading against threshold and deadzones
+      magReading = analogRead(WB_A1);
+      //    g_BleUart.println(magReading); //Debug code
+      //    g_BleUart.println("Magnet triggered");
+      //    g_BleUart.println(magNorm + magDeadzone);
+      //    g_BleUart.println(magNorm - magDeadzone);
+      digitalWrite(gLED, HIGH);
+      digitalWrite(rLED, LOW);
+      digitalWrite(bLED, LOW);
+      digitalWrite(wLED, LOW);
+      delay(500);
+      unsigned long magTime = millis();
+      while ((magReading  > magNorm + magDeadzone || magReading < magNorm - magDeadzone) && millis() - magTime < 1500) { //check if magnet is still there
+        delay(250);
+        g_BleUart.println("delaying...");
+        magReading = analogRead(WB_A1);
+        g_BleUart.println(magReading);
       }
+      if (millis() - magTime >= 1500) { //if "magnet" is still present, likely means it's actually interference, so adjust thresholds accordingly
+        g_BleUart.println("rejecting bad magnet, increasing magnet deadzone to rule out future false positives");
+        magDeadzone += 100;
+        digitalWrite(gLED, LOW);
+        digitalWrite(rLED, HIGH);
+        delay(100);
+        digitalWrite(rLED, LOW);
+      }
+      else {
+        g_BleUart.println("magnet confirmed, zeroing");
+        digitalWrite(gLED, LOW);
+        delay(50);
+        digitalWrite(gLED, HIGH);
+        zeroAngles();
+        digitalWrite(gLED, LOW);
+      }
+      digitalWrite(rLED, LOW);
     }
-  } 
-  else 
+}
+
+int getBattLevel() {
+  volatile int reading = 0;
+
+  for (int i = 0; i < 10; i++) {
+    reading += analogRead(battPin);
+    delay(50);
+  }
+  reading /= 10;
+
+  reading = constrain(map(reading, 682, 4087, 0, 100), 0, 100); //0% is ~0.5V, technically lower limit for cells is 2.7.
+
+  if (reading <= 10) {
+    digitalWrite(rLED, HIGH);
+    delay(50);
+    digitalWrite(rLED, LOW);
+  }
+
+  blebas.write(reading);
+  battLvl = reading;
+  g_BleUart.println(analogRead(battPin));
+  g_BleUart.println(battLvl);
+  return reading;
+}
+
+void zeroAngles() { //invoked on 'z' command or when a magnet is present
+  digitalWrite(gLED, HIGH);
+  inclinometer.begin(SPI, WB_SPI_CS);
+  accelXzero = 0;
+  accelYzero = 0;
+  for (int i = 0; i < 50; i++) {
+    while (!inclinometer.available()) delay(10);
+
+    accelX = abs(inclinometer.getTiltLevelOffsetAngleX());
+    accelY = abs(inclinometer.getTiltLevelOffsetAngleY());
+    accelXfiltered.add(accelX);
+    accelYfiltered.add(accelY);
+    accelXzero = accelXfiltered.get();
+    accelYzero = accelYfiltered.get();
+  }
+  inclinometer.powerDownMode();
+  sleepSPI();
+
+  digitalWrite(gLED, LOW);
+}
+
+void loopColors() {
+  for (int i = 13; i <= 16; i++) {
+    g_BleUart.println(i);
+    pinMode(i, OUTPUT);
+    digitalWrite(i, HIGH);
+    delay(1500);
+    digitalWrite(i, LOW);
+  }
+}
+
+void sendBLE() {
+  //writes to BLE UART characteristic according to currentMode
+
+  switch (currentMode) {
+    case 'r':
+      //realtime reporting mode
+      while (currentMode == 'r') {
+        inclinometer.begin(SPI, WB_SPI_CS); //necessary
+        parseBLEUART();
+        pollAccel();
+        g_BleUart.println(formAccelString());
+      }
+      break;
+    case 'p':
+      //periodic reporting mode
+      g_BleUart.println(formAccelString());
+      break;
+    case 'c':
+      //on-catastrophe reporting mode
+      if (abs(accelX) >= accelThreshold || abs(accelY) >= accelThreshold) {
+        g_BleUart.println(formAccelString());
+        //g_BleUart.println("Catastrophe!");
+      }
+      break;
+    case 'C':
+
+      //on-signficant-change reporting mode
+      //      g_BleUart.print("lastVal: "); g_BleUart.println(accelXlast);
+      //      g_BleUart.print("currentVal: "); g_BleUart.println(accelX);
+      if (abs(abs(accelX) - abs(accelXlast)) >= accelThreshold || abs(abs(accelY) - abs(accelYlast)) >= accelThreshold) {
+        delay(dwellTime);
+        getOneSample();
+        if (abs(abs(accelX) - abs(accelXlast)) >= accelThreshold || abs(abs(accelY) - abs(accelYlast)) >= accelThreshold) {
+          g_BleUart.println(formAccelString());
+          //g_BleUart.println("Significant change!");
+          accelXlast = accelX;
+          accelYlast = accelY;
+        }
+
+      }
+      break;
+    default:
+      //unrecognized reporting mode, or mode 'd' which is handled in parseBLEUART
+      currentMode = '0';
+      break;
+  }
+}
+
+void parseBLEUART() { //checks if commands are available to be done, and acts accordingly
+  if (g_BleUart.available())
   {
-    // Client connected
-    client.loop();
-    //Serial.println("now: " + currentTime);
-    delay(1000);
+    String incoming = g_BleUart.readString();
+    lastMode = currentMode;
+    currentMode = incoming[0];
+
+    switch (currentMode) {
+      case 'z':
+        //        getOneSample();
+        //        accelXzero = accelX + accelXzero;
+        //        accelYzero = accelY + accelYzero;
+        zeroAngles();
+        currentMode = lastMode;
+        break;
+      case 'r':
+        //realtime reporting mode
+        pauseInterval = 0;
+        break;
+      case 'p':
+        //periodic reporting mode
+        incoming.remove(0, 1);
+        pauseInterval = incoming.toInt();
+        break;
+      case 'd':
+        //on-demand reporting mode
+        g_BleUart.println(formAccelString());
+        pauseInterval = 5;
+        break;
+      case 'c':
+        //on-catastrophe reporting mode
+        incoming.remove(0, 1);
+        accelThreshold = incoming.toFloat();
+        pauseInterval = 5;
+        break;
+      case 'm':
+        //check magnet
+        incoming.remove(0, 1);
+        checkMag();
+        pauseInterval = 5;
+        currentMode = lastMode;
+        break;
+      case 'C':
+        //on-signficant-change reporting mode, thresh[float],dwell[int],pauseInterval[int]
+        incoming.remove(0, 1);
+        parseChangeCommand(incoming);
+        break;
+      case 'b': {
+          //report battery
+          getBattLevel();
+          currentMode = lastMode;
+        }
+        break;
+      default:
+        //unrecognized reporting mode
+        currentMode = '0';
+        break;
+    }
+
+  }
+}
+
+void parseChangeCommand(String incoming) {
+  float AaccelThreshold;
+  g_BleUart.println("enter threshold (Ex. 5.0)"); //set accelThreshold
+  while (!g_BleUart.available()) {
+    delay(500);
+  }
+  String Cincoming = g_BleUart.readString();
+  AaccelThreshold = Cincoming.toFloat();
+
+  g_BleUart.println("enter dwell time (milliseconds)"); //set dwellTime in milliseconds
+  while (!g_BleUart.available()) {
+    delay(500);
+  }
+  Cincoming = g_BleUart.readString();
+  dwellTime = Cincoming.toInt();
+
+  g_BleUart.println("enter sensor polling interval (seconds)"); //set pauseInterval
+  while (!g_BleUart.available()) {
+    delay(500);
+  }
+  Cincoming = g_BleUart.readString();
+  pauseInterval = Cincoming.toInt();
+
+  g_BleUart.print("threshold: ");  g_BleUart.println(AaccelThreshold);
+  g_BleUart.print("dwellTime: ");  g_BleUart.println(dwellTime);
+  g_BleUart.print("sensingInterval: ");  g_BleUart.println(pauseInterval);
+
+
+}
+
+void updateAdv() {
+  formAccelString();
+  byte xArray[4];
+  byte yArray[4];
+
+  *((float *)xArray) = reportX;
+  *((float *)yArray) = reportY;
+
+  for (int i = 0; i < 4; i++) {
+    advData[i] = xArray[i];
+  }
+  for (int i = 4; i < 8; i++) {
+    advData[i] = yArray[i - 4];
+  }
+  advData[8] = battLvl;
+
+  Bluefruit.Advertising.clearData();
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  //Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addManufacturerData(advData, 9);
+  Bluefruit.Advertising.addName();
+}
+
+void getOneSample() {
+  int delayTime = 0;
+  inclinometer.begin(SPI, WB_SPI_CS);
+  delay(delayTime);
+  pollAccel();
+  inclinometer.powerDownMode();
+  sleepSPI();
+}
+
+void sleepSPI() {
+  SPI.end();
+  digitalWrite(WB_SPI_CS, LOW);
+  digitalWrite(WB_SPI_MOSI, LOW);
+  digitalWrite(WB_SPI_MISO, LOW);
+  digitalWrite(WB_SPI_CLK, LOW);
+}
+
+
+void setupAccel() {
+  delay(100);
+  if (inclinometer.begin(SPI, WB_SPI_CS) == false) {
+
+    digitalWrite(rLED, HIGH);
+    delay(250);
+    digitalWrite(rLED, LOW);
+    delay(250);
+
+  }
+
+}
+
+void pollAccel() {
+
+  while (!inclinometer.available()) delay(10);
+
+  accelX = inclinometer.getTiltLevelOffsetAngleX() - accelXzero;
+  accelY = inclinometer.getTiltLevelOffsetAngleY() - accelYzero;
+  accelXfiltered.add(accelX);
+  accelYfiltered.add(accelY);
+
+
+}
+
+String formAccelString() {
+  String toSend;
+
+  //toSend += "X: ";
+  toSend += String(accelX);
+  toSend += ", ";
+  toSend += String(accelY);
+  //  toSend += ": ";
+  //  toSend += String(rawBattLvl);
+
+  reportX = accelX;
+  reportY = accelY;
+
+  return toSend;
+}
+
+void ble_connect_callback(uint16_t conn_handle)
+{
+  (void)conn_handle;
+  g_BleUartConnected = true;
+
+  //Serial.println("BLE client connected");
+  //delay(1000);
+  g_BleUart.println("TopTilt PoC ONLINE!");
+  g_BleUart.println("Waiting for commands...");
+  g_BleUart.println("TopTilt PoC ONLINE!");
+  g_BleUart.println("Waiting for commands...");
+  g_BleUart.println("TopTilt PoC ONLINE!");
+  g_BleUart.println("Waiting for commands...");
+
+}
+
+void ble_disconnect_callback(uint16_t conn_handle, uint8_t reason)
+{
+  (void)conn_handle;
+  (void)reason;
+  g_BleUartConnected = false;
+
+  //Serial.println("BLE client disconnected");
+}
+
+void getManySamples(int samples) {
+  //inclinometer.begin(A5); //V1.5 uses A5, V1.0 uses _CS
+  inclinometer.begin(SPI, WB_SPI_CS);
+  for (int i = 0; i < samples; i++) {
+    pollAccel();
+  }
+  inclinometer.powerDownMode();
+  sleepSPI();
+}
+
+void nrf_peripherals_power_init(void) {
+  // Set GPIO reference voltage to 3.3V if it isn't already. REGOUT0 will get reset to 0xfffffff
+  // if flash is erased, which sets the default to 1.8V
+  // This matters only when "high voltage mode" is enabled, which is true on the PCA10059,
+  // and might be true on other boards.
+  if (NRF_UICR->REGOUT0 == 0xffffffff && NRF_POWER->MAINREGSTATUS & 1) {
+    // Expand what nrf_nvmc_word_write() did.
+    // It's missing from nrfx V2.0.0, and nrfx_nvmc_word_write() does bounds
+    // checking which prevents writes to UICR.
+    // Reported: https://devzone.nordicsemi.com/f/nordic-q-a/57243/nrfx_nvmc-h-api-cannot-write-to-uicr
+    NRF_NVMC->CONFIG = NRF_NVMC_MODE_WRITE;
+    while (!(NRF_NVMC->READY & NVMC_READY_READY_Msk)) {
+    }
+    NRF_UICR->REGOUT0 = UICR_REGOUT0_VOUT_3V3 << UICR_REGOUT0_VOUT_Pos;
+    __DMB();
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {
+    }
+    NRF_NVMC->CONFIG = NRF_NVMC_MODE_READONLY;
+
+    // Must reset to enable change.
+    NVIC_SystemReset();
   }
 }
