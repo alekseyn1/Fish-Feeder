@@ -12,4 +12,6 @@ Did not have time to complete the relay on/off via the firmware
 Feeding is in the firmware but can also be achieved via Home Assistant if required (I chose to do it all via ESP8622 firmware) by commenting out line 345 [feeding();]
 The feeding switch will turn off as soon as the movement of the feeder completes (1-2 sec)
 The amount of food is controlled by the width of the opening of the traveling piece inside the feeder.
-The included design seems to be the correct size for a single betta fish with feed times at 8:00 and 20:00
+The included design seems to be the correct size for a single betta fish with feed times at 8:00 and 20:00.
+
+Update: my betta died when he was about 3.5 years. Last two ran on this system.
